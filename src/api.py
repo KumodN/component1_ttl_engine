@@ -1,140 +1,308 @@
-from flask import Flask, request, jsonify
-import pandas as pd
-import numpy as np
-import joblib
-from tensorflow.keras.models import load_model
+import json
+import logging
 import os
+import sys
 import time
 from datetime import datetime
+from pathlib import Path
 
-# Import your custom modules
-from volatility import VolatilityEngine, HotKeyDetector
+import joblib
+import numpy as np
+import pandas as pd
+from flask import Flask, jsonify, request
+from tensorflow.keras.models import load_model
+
+# ── Logging setup ─────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger("api")
+
+# ── Config & Custom Modules ───────────────────────────────────────────────────
+# Add src/ to path so imports work when run from project root
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from config import cfg
 from fusion_engine import TTLFusionEngine
+from hotkey_detector import HotKeyDetector
+from volatility import VolatilityEngine
 
 app = Flask(__name__)
 
-# --- Load Models & Metadata ---
-print("Loading models and metadata...")
-metadata = pd.read_csv('models/model_metadata.txt')
-models = {}
-scalers = {}
-for _, row in metadata.iterrows():
-    key = row['key']
-    selected = row['selected_model']
-    safe_key = key.replace(':', '_').replace('/', '_').replace('\\', '_')
+logger.info("=== API Startup: Loading models and data ===")
+_startup_start = time.perf_counter()
+
+# 1. Model metadata (JSON)
+logger.info("Loading model metadata from: %s", cfg.METADATA_PATH)
+try:
+    with open(cfg.METADATA_PATH) as f:
+        _raw_meta = json.load(f)
+    _metadata: list[dict] = _raw_meta["models"]
+    _model_version: str   = _raw_meta.get("version", "unknown")
+    _generated_at: str    = _raw_meta.get("generated_at", "unknown")
+    logger.info(
+        "Metadata loaded: version=%s, %d keys, generated_at=%s",
+        _model_version, len(_metadata), _generated_at,
+    )
+except Exception as exc:
+    logger.error("FATAL: Could not load model metadata: %s", exc)
+    _metadata, _model_version, _generated_at = [], "error", "unknown"
+
+# 2. Per-key models and scalers
+logger.info("Loading per-key LSTM models and scalers...")
+_models:  dict[str, object] = {}
+_scalers: dict[str, object] = {}
+_key_model_map: dict[str, str] = {}
+
+for entry in _metadata:
+    key       = entry["key"]
+    safe_key  = entry.get("safe_key", key.replace(":", "_").replace("/", "_"))
+    selected  = entry["selected_model"]
+    _key_model_map[key] = selected
+
     if selected == "LSTM":
-        models[key] = load_model(f'models/lstm_{safe_key}.keras')
-        scalers[key] = joblib.load(f'models/scaler_{safe_key}.pkl')
+        model_path  = cfg.MODEL_DIR / f"lstm_{safe_key}.keras"
+        scaler_path = cfg.MODEL_DIR / f"scaler_{safe_key}.pkl"
+        try:
+            _models[key]  = load_model(str(model_path))
+            _scalers[key] = joblib.load(str(scaler_path))
+            logger.info("  Loaded LSTM model  for key='%s'", key)
+        except Exception as exc:
+            logger.warning("  Could not load LSTM for key='%s': %s", key, exc)
     else:
-        # For ARIMA, we would load the saved ARIMA model here.
-        # For this MVP, we simulate with a placeholder.
-        models[key] = "ARIMA_Placeholder"
+        _models[key] = "ARIMA_PLACEHOLDER"
+        logger.info("  Registered ARIMA model for key='%s'", key)
 
-# --- Load Feature Data ---
-# In production, this would be live. For now, we load the historical processed data.
-feature_df = pd.read_csv('data/processed_features.csv', parse_dates=['bucket'])
+# 3. Historical feature data (for LSTM input construction)
+logger.info("Loading processed features from: %s", cfg.PROCESSED_FEATURES_PATH)
+try:
+    _feature_df = pd.read_csv(cfg.PROCESSED_FEATURES_PATH, parse_dates=["bucket"])
+    logger.info("Feature data loaded: %d rows.", len(_feature_df))
+except Exception as exc:
+    logger.error("Could not load feature data: %s", exc)
+    _feature_df = pd.DataFrame()
 
-# --- Initialize Engines ---
-volatility_engine = VolatilityEngine(alpha=0.3)
-hotkey_detector = HotKeyDetector(threshold=1000)
-ttl_engine = TTLFusionEngine(min_ttl=10, max_ttl=3600)
+# 4. DB update logs — pre-loaded to avoid per-request disk reads
+logger.info("Loading DB update logs from: %s", cfg.DB_UPDATES_PATH)
+try:
+    _db_updates_df = pd.read_csv(cfg.DB_UPDATES_PATH, parse_dates=["timestamp"])
+    logger.info("DB update log loaded: %d rows.", len(_db_updates_df))
+except Exception as exc:
+    logger.error("Could not load DB update log: %s", exc)
+    _db_updates_df = pd.DataFrame(columns=["timestamp", "cache_key"])
 
-# --- Helper Functions ---
-def get_features_for_key(key, current_time):
+# 5. Engine instances
+_volatility_engine = VolatilityEngine(alpha=cfg.EWMA_ALPHA)
+_hotkey_detector   = HotKeyDetector(
+    threshold=cfg.HOTKEY_THRESHOLD,
+    window_seconds=cfg.HOTKEY_WINDOW_SECONDS,
+)
+_ttl_engine = TTLFusionEngine(min_ttl=cfg.MIN_TTL, max_ttl=cfg.MAX_TTL)
+
+_startup_ms = (time.perf_counter() - _startup_start) * 1000
+logger.info("=== API Startup complete in %.0f ms ===", _startup_ms)
+
+# Feature columns must match training order in train_models.py
+_FEATURE_COLS = ["request_count", "hour_sin", "hour_cos", "dow_sin", "dow_cos"]
+_N_FEATURES   = len(_FEATURE_COLS)
+_SEQ_LEN      = cfg.SEQUENCE_LENGTH
+_MAX_COUNT    = 150  # Used to normalise raw count into a popularity score
+
+def _get_features_for_key(key: str) -> np.ndarray | None:
     """
-    Simulates getting the last 60 buckets (5 hours) of data for a key.
-    In a real system, this fetches from Redis/InfluxDB.
+    Return the last `_SEQ_LEN` rows of feature data for `key`.
+    Returns None if insufficient history exists.
     """
-    # Filter for key and get last 60 rows
-    data = feature_df[feature_df['cache_key'] == key].sort_values('bucket')
-    if len(data) < 60:
+    if _feature_df.empty:
         return None
-    
-    # Get last 60 records (historical data up to now)
-    # In production, we would simulate real-time feeding. 
-    # For this MVP, we just take the last batch.
-    return data.iloc[-60:]
+    key_data = _feature_df[_feature_df["cache_key"] == key].sort_values("bucket")
+    if len(key_data) < _SEQ_LEN:
+        logger.debug(
+            "Insufficient history for key='%s': have %d, need %d",
+            key, len(key_data), _SEQ_LEN,
+        )
+        return None
+    return key_data[_FEATURE_COLS].values[-_SEQ_LEN:]
 
-def predict_popularity(key, current_time):
+
+def _predict_popularity(key: str) -> float:
     """
-    Runs the selected model (LSTM or ARIMA) to predict future request count.
-    Returns a normalized popularity score (0 to 1).
+    Run the selected model and return a normalised popularity score [0, 1].
+    Falls back to 0.5 if the key is unknown or prediction fails.
     """
-    if key not in models:
-        return 0.5  # Default if unknown key
-    
-    selected = metadata[metadata['key'] == key]['selected_model'].values[0]
-    
+    if key not in _models:
+        logger.debug("Unknown key='%s'; using default popularity 0.5", key)
+        return 0.5
+
+    selected = _key_model_map.get(key, "ARIMA")
+
     if selected == "LSTM":
-        # Prepare features
-        recent_data = get_features_for_key(key, current_time)
-        if recent_data is None:
+        raw_features = _get_features_for_key(key)
+        if raw_features is None:
             return 0.5
-        
-        # Extract features used in training (must match training order)
-        features = ['request_count', 'hour_sin', 'hour_cos', 'dow_sin', 'dow_cos']
-        input_data = recent_data[features].values
-        
-        # Scale
-        scaler = scalers[key]
-        scaled_input = scaler.transform(input_data)
-        
-        # Reshape for LSTM (1 sample, 60 timesteps, 5 features)
-        lstm_input = scaled_input.reshape(1, 60, 5)
-        
-        # Predict
-        pred_scaled = models[key].predict(lstm_input, verbose=0)
-        
-        # Invert scaling (only for request_count)
-        dummy = np.zeros((1, len(features)))
-        dummy[0, 0] = pred_scaled[0, 0]
-        pred_count = scaler.inverse_transform(dummy)[0, 0]
-        
-        # Normalize to 0-1 (assuming max request count is 100 for this dataset)
-        max_count = 150  # This can be tuned or derived from historical data
-        return min(1.0, pred_count / max_count)
-    
-    else:  # ARIMA placeholder
+
+        scaler = _scalers[key]
+        scaled = scaler.transform(raw_features)
+
+        # Reshape to (1, seq_len, n_features)
+        lstm_input = scaled.reshape(1, _SEQ_LEN, _N_FEATURES)
+
+        # Predict — model may output shape (1,1) or (1,n_features) depending
+        # on whether it was trained with the old Dense(1) or new Dense(n_features).
+        pred_scaled = _models[key].predict(lstm_input, verbose=0)
+
+        # Normalise to shape (1, n_features) by padding with zeros so
+        # scaler.inverse_transform always receives the expected column count.
+        n_out = pred_scaled.shape[1]
+        if n_out < _N_FEATURES:
+            dummy = np.zeros((1, _N_FEATURES))
+            dummy[0, :n_out] = pred_scaled[0, :n_out]
+            pred_scaled = dummy
+
+        # Invert scaling to get raw request count (column 0)
+        pred_raw   = scaler.inverse_transform(pred_scaled)   # (1, n_features)
+        pred_count = float(pred_raw[0, 0])
+
+        popularity = min(1.0, max(0.0, pred_count / _MAX_COUNT))
+        logger.debug(
+            "LSTM prediction for key='%s': raw_count=%.2f, popularity=%.3f",
+            key, pred_count, popularity,
+        )
+        return popularity
+
+    else:  # ARIMA (placeholder — extend to load pickled ARIMA if needed)
+        logger.debug("ARIMA placeholder for key='%s': returning 0.7", key)
         return 0.7
 
-@app.route('/api/v1/predict/<cache_key>', methods=['POST'])
-def predict_ttl(cache_key):
-    # Get current time and simulate system load (optional)
-    current_time = datetime.now()
-    
-    # 1. Get Volatility Score
-    db_updates = pd.read_csv('data/db_updates.csv', parse_dates=['timestamp'])
-    volatility_score = volatility_engine.update(cache_key, current_time, db_updates)
-    
-    # 2. Get Popularity Score
-    popularity_score = predict_popularity(cache_key, current_time)
-    
-    # 3. Check if Hot Key
-    # Simulate recording a request (in production, this is called by the sidecar)
-    is_hot = hotkey_detector.record_request(cache_key)
-    
-    # 4. Calculate TTL
-    suggested_ttl = ttl_engine.calculate_ttl(popularity_score, volatility_score, is_hot)
-    
-    # 5. Generate Confidence (simple logic: based on how much data we have)
-    # If we have less than 100 records for this key, confidence is low
-    key_data = feature_df[feature_df['cache_key'] == cache_key]
-    if len(key_data) < 100:
-        confidence = 0.3
-    else:
-        confidence = 0.9
-    
-    # 6. Response JSON
-    response = {
-        "cache_key": cache_key,
-        "popularity": round(popularity_score, 3),
-        "volatility": round(volatility_score, 3),
-        "is_hot": is_hot,
-        "suggested_ttl": int(suggested_ttl),
-        "confidence": confidence,
-        "model_version": "v1.0.0-MVP"
-    }
-    return jsonify(response)
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5001, debug=True)
+def _build_response(
+    cache_key: str,
+    popularity: float,
+    volatility: float,
+    is_hot: bool,
+    suggested_ttl: int,
+    confidence: float,
+) -> dict:
+    return {
+        "cache_key":     cache_key,
+        "popularity":    round(popularity, 4),
+        "volatility":    round(volatility, 4),
+        "is_hot":        is_hot,
+        "suggested_ttl": suggested_ttl,
+        "confidence":    round(confidence, 4),
+        "model_version": _model_version,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.route("/api/v1/predict/<path:cache_key>", methods=["POST"])
+def predict_ttl(cache_key: str):
+    """
+    Predict the optimal TTL for a cache key.
+
+    Returns JSON with: cache_key, popularity, volatility, is_hot,
+                       suggested_ttl, confidence, model_version.
+    """
+    t_start = time.perf_counter()
+    logger.info("POST /api/v1/predict/%s", cache_key)
+
+    try:
+        current_time = datetime.now()
+
+        # Unknown key — return safe default immediately, no model inference
+        if cache_key not in _key_model_map:
+            elapsed_ms = (time.perf_counter() - t_start) * 1000
+            logger.info(
+                "Unknown key='%s': returning default TTL=%ds, confidence=0.1 [%.1f ms]",
+                cache_key, cfg.DEFAULT_TTL, elapsed_ms,
+            )
+            return jsonify(
+                _build_response(
+                    cache_key=cache_key,
+                    popularity=0.5,
+                    volatility=0.0,
+                    is_hot=False,
+                    suggested_ttl=cfg.DEFAULT_TTL,
+                    confidence=0.1,
+                )
+            ), 200
+
+        # 1. Volatility — uses pre-loaded db_updates_df (no disk I/O)
+        volatility_score = _volatility_engine.update(
+            cache_key, current_time, _db_updates_df
+        )
+
+        # 2. Popularity prediction
+        popularity_score = _predict_popularity(cache_key)
+
+        # 3. Hot-key detection (records this request)
+        is_hot = _hotkey_detector.record_request(cache_key)
+
+        # 4. Fuse into final TTL
+        suggested_ttl = int(_ttl_engine.calculate_ttl(
+            popularity_score, volatility_score, is_hot
+        ))
+
+        # 5. Confidence: based on historical data volume for this key
+        key_rows = (_feature_df["cache_key"] == cache_key).sum()
+        confidence = 0.9 if key_rows >= 100 else 0.3
+
+        elapsed_ms = (time.perf_counter() - t_start) * 1000
+        logger.info(
+            "Prediction for key='%s': ttl=%ds, pop=%.3f, vol=%.3f, hot=%s, conf=%.2f [%.1f ms]",
+            cache_key, suggested_ttl, popularity_score, volatility_score,
+            is_hot, confidence, elapsed_ms,
+        )
+
+        return jsonify(
+            _build_response(
+                cache_key, popularity_score, volatility_score,
+                is_hot, suggested_ttl, confidence,
+            )
+        ), 200
+
+    except Exception as exc:
+        elapsed_ms = (time.perf_counter() - t_start) * 1000
+        logger.error(
+            "Error predicting for key='%s': %s [%.1f ms]",
+            cache_key, exc, elapsed_ms, exc_info=True,
+        )
+        # Safe default response — never return a 500 to the caller
+        return jsonify(
+            _build_response(
+                cache_key=cache_key,
+                popularity=0.5,
+                volatility=0.0,
+                is_hot=False,
+                suggested_ttl=cfg.DEFAULT_TTL,
+                confidence=0.1,
+            )
+        ), 200
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    """Liveness probe — returns service status and current model version."""
+    return jsonify({
+        "status":        "ok",
+        "model_version": _model_version,
+        "generated_at":  _generated_at,
+        "keys_loaded":   len(_models),
+    }), 200
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry Point
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    logger.info(
+        "Starting Flask dev server on %s:%d (debug=%s)",
+        cfg.HOST, cfg.PORT, cfg.DEBUG,
+    )
+    app.run(host=cfg.HOST, port=cfg.PORT, debug=cfg.DEBUG)
